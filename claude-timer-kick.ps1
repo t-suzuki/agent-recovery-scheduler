@@ -165,13 +165,21 @@ Add-Type -AssemblyName System.Drawing
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = $Script:AppName
-$form.Size            = New-Object System.Drawing.Size(520, 580)
+$form.Size            = New-Object System.Drawing.Size(520, 620)
 $form.StartPosition   = "CenterScreen"
 $form.FormBorderStyle = "FixedSingle"
 $form.MaximizeBox     = $false
 $form.Font            = New-Object System.Drawing.Font("Segoe UI", 9)
 
 $cfg = Load-Config
+
+# ── 説明ラベル ──
+$lblDesc = New-Object System.Windows.Forms.Label
+$lblDesc.Text      = "5時間ローリングウィンドウを定期的にキックし、レート制限のリフレッシュを早めます。"
+$lblDesc.Location  = New-Object System.Drawing.Point(14, 10)
+$lblDesc.Size      = New-Object System.Drawing.Size(480, 20)
+$lblDesc.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
+$form.Controls.Add($lblDesc)
 
 # ── ヘルパー: ツールセクション生成 ───────────────────────────────────
 function New-ToolSection ([string]$tool, [int]$top, $parentForm, $cfgSection) {
@@ -247,12 +255,12 @@ function New-ToolSection ([string]$tool, [int]$top, $parentForm, $cfgSection) {
     $updateStatus = {
         $exists = Test-TaskExists $tool
         if ($exists) {
-            $lblSt.Text      = "状態:  ON"
+            $lblSt.Text      = "定期キック:  ON"
             $lblSt.ForeColor = [System.Drawing.Color]::Green
             $btnOn.Enabled   = $false
             $btnOff.Enabled  = $true
         } else {
-            $lblSt.Text      = "状態:  OFF"
+            $lblSt.Text      = "定期キック:  OFF"
             $lblSt.ForeColor = [System.Drawing.Color]::Gray
             $btnOn.Enabled   = $true
             $btnOff.Enabled  = $false
@@ -288,13 +296,13 @@ function New-ToolSection ([string]$tool, [int]$top, $parentForm, $cfgSection) {
 }
 
 # ── 2つのセクション作成 ──────────────────────────────────────────────
-New-ToolSection "Claude" 10  $form $cfg.Claude
-New-ToolSection "Codex"  160 $form $cfg.Codex
+New-ToolSection "Claude" 36  $form $cfg.Claude
+New-ToolSection "Codex"  186 $form $cfg.Codex
 
 # ── ログ領域 ─────────────────────────────────────────────────────────
 $grpLog = New-Object System.Windows.Forms.GroupBox
 $grpLog.Text     = "ログ"
-$grpLog.Location = New-Object System.Drawing.Point(12, 310)
+$grpLog.Location = New-Object System.Drawing.Point(12, 336)
 $grpLog.Size     = New-Object System.Drawing.Size(480, 190)
 $form.Controls.Add($grpLog)
 
@@ -352,7 +360,7 @@ $btnGitHub.Add_Click({
 # ── 情報ラベル ──
 $lblInfo = New-Object System.Windows.Forms.Label
 $lblInfo.Text      = "Claude: $($Script:ClaudeModel)  Codex: $($Script:CodexModel)  プロンプト: `"$($Script:DefaultPrompt)`""
-$lblInfo.Location  = New-Object System.Drawing.Point(12, 510)
+$lblInfo.Location  = New-Object System.Drawing.Point(12, 540)
 $lblInfo.Size      = New-Object System.Drawing.Size(480, 20)
 $lblInfo.ForeColor = [System.Drawing.Color]::Gray
 $lblInfo.Font      = New-Object System.Drawing.Font("Consolas", 7.5)
