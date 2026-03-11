@@ -51,6 +51,21 @@ function Write-Log ([string]$tool, [string]$message) {
     }
 }
 
+# ── 実行結果の判定 ───────────────────────────────────────────────────
+function Get-CommandStatus ([scriptblock]$action) {
+    $global:LASTEXITCODE = $null
+    try {
+        & $action | Out-Null
+        if ($null -ne $global:LASTEXITCODE) {
+            if ($global:LASTEXITCODE -eq 0) { return "OK" }
+            return "FAIL(exit=$global:LASTEXITCODE)"
+        }
+        return "OK"
+    } catch {
+        return "ERROR: $($_.Exception.Message)"
+    }
+}
+
 # ── 実行コマンド構築 ─────────────────────────────────────────────────
 function Build-Command ([string]$tool, [bool]$useWSL) {
     $prompt = $Script:DefaultPrompt
@@ -75,11 +90,20 @@ function Create-WrapperScript ([string]$tool, [bool]$useWSL) {
 
     # PS1 本体
     $ps1Content = @"
-`$ErrorActionPreference = 'SilentlyContinue'
+`$ErrorActionPreference = 'Stop'
 `$ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+`$global:LASTEXITCODE = `$null
 try {
-    `$output = Invoke-Expression '$cmd' 2>&1 | Out-String
-    `$status = if (`$LASTEXITCODE -eq 0 -or `$null -eq `$LASTEXITCODE) { 'OK' } else { "FAIL(exit=`$LASTEXITCODE)" }
+    Invoke-Expression '$cmd' | Out-Null
+    if (`$null -ne `$global:LASTEXITCODE) {
+        if (`$global:LASTEXITCODE -eq 0) {
+            `$status = 'OK'
+        } else {
+            `$status = "FAIL(exit=`$global:LASTEXITCODE)"
+        }
+    } else {
+        `$status = 'OK'
+    }
 } catch {
     `$status = "ERROR: `$(`$_.Exception.Message)"
 }
@@ -150,12 +174,7 @@ function Unregister-KickTask ([string]$tool) {
 function Invoke-KickNow ([string]$tool, [bool]$useWSL) {
     $cmd = Build-Command $tool $useWSL
     Write-Log $tool "手動キック: $cmd"
-    try {
-        $output = Invoke-Expression $cmd 2>&1 | Out-String
-        $status = if ($LASTEXITCODE -eq 0 -or $null -eq $LASTEXITCODE) { "OK" } else { "FAIL(exit=$LASTEXITCODE)" }
-    } catch {
-        $status = "ERROR: $($_.Exception.Message)"
-    }
+    $status = Get-CommandStatus { Invoke-Expression $cmd }
     Write-Log $tool $status
 }
 
