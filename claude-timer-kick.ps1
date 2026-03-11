@@ -26,6 +26,16 @@ $Script:RetryIntervalMinutes  = 30
 $Script:RetryDurationMinutes  = 120
 $Script:MinimumSpacingMinutes = $Script:WindowMinutes + 10
 $Script:MinimumSpacingLabel   = "5時間10分"
+$Script:WeekdayOptions        = @(
+    [PSCustomObject]@{ Name = "Monday";    Label = "月" }
+    [PSCustomObject]@{ Name = "Tuesday";   Label = "火" }
+    [PSCustomObject]@{ Name = "Wednesday"; Label = "水" }
+    [PSCustomObject]@{ Name = "Thursday";  Label = "木" }
+    [PSCustomObject]@{ Name = "Friday";    Label = "金" }
+    [PSCustomObject]@{ Name = "Saturday";  Label = "土" }
+    [PSCustomObject]@{ Name = "Sunday";    Label = "日" }
+)
+$Script:DefaultDaysOfWeek     = @("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
 $Script:DefaultRecoveryTimes  = @("11:00", "16:10", "21:20")
 
 # ── データディレクトリ確保 ───────────────────────────────────────────
@@ -61,6 +71,53 @@ function Get-RetryOffsets {
         $offsets += $offset
     }
     return $offsets
+}
+
+function Get-NormalizedDaysOfWeek ($days) {
+    $map = @{
+        "monday"    = "Monday"
+        "mon"       = "Monday"
+        "月"        = "Monday"
+        "tuesday"   = "Tuesday"
+        "tue"       = "Tuesday"
+        "火"        = "Tuesday"
+        "wednesday" = "Wednesday"
+        "wed"       = "Wednesday"
+        "水"        = "Wednesday"
+        "thursday"  = "Thursday"
+        "thu"       = "Thursday"
+        "木"        = "Thursday"
+        "friday"    = "Friday"
+        "fri"       = "Friday"
+        "金"        = "Friday"
+        "saturday"  = "Saturday"
+        "sat"       = "Saturday"
+        "土"        = "Saturday"
+        "sunday"    = "Sunday"
+        "sun"       = "Sunday"
+        "日"        = "Sunday"
+    }
+
+    $set = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($day in (ConvertTo-StringArray $days)) {
+        $key = $day.ToString().Trim().ToLowerInvariant()
+        if ($map.ContainsKey($key)) { [void]$set.Add($map[$key]) }
+    }
+
+    return @(
+        foreach ($option in $Script:WeekdayOptions) {
+            if ($set.Contains($option.Name)) { $option.Name }
+        }
+    )
+}
+
+function Get-DayOfWeekLabels ($days) {
+    $labels = @()
+    $normalized = Get-NormalizedDaysOfWeek $days
+    foreach ($option in $Script:WeekdayOptions) {
+        if ($normalized -contains $option.Name) { $labels += $option.Label }
+    }
+    return $labels
 }
 
 function ConvertTo-StringArray ($value) {
@@ -110,10 +167,12 @@ function Get-DefaultConfig {
     return [PSCustomObject]@{
         Claude = [PSCustomObject]@{
             RecoveryTimes = @($Script:DefaultRecoveryTimes)
+            DaysOfWeek = @($Script:DefaultDaysOfWeek)
             UseWSL = $false
         }
         Codex = [PSCustomObject]@{
             RecoveryTimes = @($Script:DefaultRecoveryTimes)
+            DaysOfWeek = @($Script:DefaultDaysOfWeek)
             UseWSL = $false
         }
     }
@@ -123,15 +182,19 @@ function Normalize-ToolConfig ($toolConfig) {
     if ($null -eq $toolConfig) {
         return [PSCustomObject]@{
             RecoveryTimes = @($Script:DefaultRecoveryTimes)
+            DaysOfWeek = @($Script:DefaultDaysOfWeek)
             UseWSL = $false
         }
     }
 
     $times = Get-NormalizedRecoveryTimes $toolConfig.RecoveryTimes
     if ($times.Count -eq 0) { $times = @($Script:DefaultRecoveryTimes) }
+    $days = Get-NormalizedDaysOfWeek $toolConfig.DaysOfWeek
+    if ($days.Count -eq 0) { $days = @($Script:DefaultDaysOfWeek) }
 
     return [PSCustomObject]@{
         RecoveryTimes = @($times)
+        DaysOfWeek = @($days)
         UseWSL = ConvertTo-Bool $toolConfig.UseWSL
     }
 }
@@ -154,18 +217,22 @@ function Save-Config ($cfg) {
     $payload = [PSCustomObject]@{
         Claude = [PSCustomObject]@{
             RecoveryTimes = @($cfg.Claude.RecoveryTimes)
+            DaysOfWeek = @($cfg.Claude.DaysOfWeek)
             UseWSL = [bool]$cfg.Claude.UseWSL
         }
         Codex = [PSCustomObject]@{
             RecoveryTimes = @($cfg.Codex.RecoveryTimes)
+            DaysOfWeek = @($cfg.Codex.DaysOfWeek)
             UseWSL = [bool]$cfg.Codex.UseWSL
         }
     }
     $payload | ConvertTo-Json -Depth 4 | Set-Content $Script:ConfigFile -Encoding UTF8
 }
 
-function Get-RecoveryPlan ($times) {
+function Get-RecoveryPlan ($times, $daysOfWeek) {
     $normalized = Get-NormalizedRecoveryTimes $times
+    $selectedDays = Get-NormalizedDaysOfWeek $daysOfWeek
+    $dayLabels = Get-DayOfWeekLabels $selectedDays
     $issues = New-Object 'System.Collections.Generic.List[string]'
     $items = New-Object 'System.Collections.Generic.List[object]'
 
@@ -174,9 +241,16 @@ function Get-RecoveryPlan ($times) {
         return [PSCustomObject]@{
             IsValid = $false
             RecoveryTimes = @()
+            DaysOfWeek = @()
+            DayLabels = @()
             Items = @()
+            KickMinutes = @()
             Issues = @($issues)
         }
+    }
+
+    if ($selectedDays.Count -eq 0) {
+        $issues.Add("曜日を1つ以上選択してください。")
     }
 
     $minutes = @()
@@ -219,6 +293,8 @@ function Get-RecoveryPlan ($times) {
     return [PSCustomObject]@{
         IsValid = ($issues.Count -eq 0)
         RecoveryTimes = @($normalized)
+        DaysOfWeek = @($selectedDays)
+        DayLabels = @($dayLabels)
         Items = @($items | Sort-Object RecoveryMinutes)
         KickMinutes = @($allKickMinutes | Sort-Object)
         Issues = @($issues)
@@ -231,6 +307,10 @@ function Get-RecoveryPlanText ($plan) {
     if ($plan.RecoveryTimes.Count -eq 0) {
         $lines.Add("回復時刻を追加すると、5時間前から再試行 kick を自動計算します。")
     } else {
+        if ($plan.DayLabels.Count -gt 0) {
+            $lines.Add("曜日: $($plan.DayLabels -join ' ')")
+            $lines.Add("")
+        }
         foreach ($item in $plan.Items) {
             $lines.Add("$($item.KickStartTime)-$($item.KickEndTime) kick /$($Script:RetryIntervalMinutes)m -> $($item.RecoveryTime)")
         }
@@ -422,8 +502,8 @@ function Test-TaskExists ([string]$tool) {
     return ($null -ne $task)
 }
 
-function Register-KickTask ([string]$tool, $recoveryTimes, [bool]$useWSL) {
-    $plan = Get-RecoveryPlan $recoveryTimes
+function Register-KickTask ([string]$tool, $recoveryTimes, $daysOfWeek, [bool]$useWSL) {
+    $plan = Get-RecoveryPlan $recoveryTimes $daysOfWeek
     if (-not $plan.IsValid) {
         throw ($plan.Issues -join " ")
     }
@@ -437,7 +517,7 @@ function Register-KickTask ([string]$tool, $recoveryTimes, [bool]$useWSL) {
     $triggers = @()
     foreach ($kickMinute in $plan.KickMinutes) {
         $at = (Get-Date).Date.AddMinutes([int]$kickMinute)
-        $triggers += New-ScheduledTaskTrigger -Daily -At $at
+        $triggers += New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $plan.DaysOfWeek -At $at
     }
 
     $settings = New-ScheduledTaskSettingsSet `
@@ -459,7 +539,8 @@ function Register-KickTask ([string]$tool, $recoveryTimes, [bool]$useWSL) {
         $targets += "$($item.KickStartTime)-$($item.KickEndTime)->$($item.RecoveryTime)"
     }
     $targetSummary = $targets -join ", "
-    Write-Log $tool "タスク登録 ($targetSummary, WSL=$useWSL)"
+    $daySummary = $plan.DayLabels -join ""
+    Write-Log $tool "タスク登録 ($targetSummary, 曜日=$daySummary, WSL=$useWSL)"
 }
 
 function Unregister-KickTask ([string]$tool) {
@@ -492,7 +573,7 @@ Add-Type -AssemblyName System.Drawing
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = $Script:AppName
-$form.Size            = New-Object System.Drawing.Size(520, 760)
+$form.Size            = New-Object System.Drawing.Size(520, 840)
 $form.StartPosition   = "CenterScreen"
 $form.FormBorderStyle = "FixedSingle"
 $form.MaximizeBox     = $false
@@ -501,14 +582,14 @@ $form.Font            = New-Object System.Drawing.Font("Segoe UI", 9)
 $cfg = Load-Config
 
 $lblDesc = New-Object System.Windows.Forms.Label
-$lblDesc.Text      = "回復していてほしい時刻を指定すると、その5時間前から再試行 kick を毎日自動で登録します。"
+$lblDesc.Text      = "回復していてほしい時刻と曜日を指定すると、その5時間前から再試行 kick を自動で登録します。"
 $lblDesc.Location  = New-Object System.Drawing.Point(14, 10)
 $lblDesc.Size      = New-Object System.Drawing.Size(480, 20)
 $lblDesc.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
 $form.Controls.Add($lblDesc)
 
 $lblHint = New-Object System.Windows.Forms.Label
-$lblHint.Text      = "迷ったら 11:00 / 16:10 / 21:20。各時刻の5時間前から2時間、30分おきに再試行します。"
+$lblHint.Text      = "迷ったら平日の 11:00 / 16:10 / 21:20。各時刻の5時間前から2時間、30分おきに再試行します。"
 $lblHint.Location  = New-Object System.Drawing.Point(14, 30)
 $lblHint.Size      = New-Object System.Drawing.Size(480, 20)
 $lblHint.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
@@ -518,7 +599,7 @@ function New-ToolSection ([string]$tool, [int]$top, $parentForm, $cfgSection) {
     $grp = New-Object System.Windows.Forms.GroupBox
     $grp.Text     = "$tool"
     $grp.Location = New-Object System.Drawing.Point(12, $top)
-    $grp.Size     = New-Object System.Drawing.Size(480, 220)
+    $grp.Size     = New-Object System.Drawing.Size(480, 255)
     $parentForm.Controls.Add($grp)
 
     $lblTime = New-Object System.Windows.Forms.Label
@@ -556,14 +637,34 @@ function New-ToolSection ([string]$tool, [int]$top, $parentForm, $cfgSection) {
     $chkWSL.Checked  = $cfgSection.UseWSL
     $grp.Controls.Add($chkWSL)
 
+    $lblDays = New-Object System.Windows.Forms.Label
+    $lblDays.Text     = "曜日:"
+    $lblDays.Location = New-Object System.Drawing.Point(14, 60)
+    $lblDays.AutoSize = $true
+    $grp.Controls.Add($lblDays)
+
+    $dayCheckboxes = @()
+    $dayLeft = 58
+    foreach ($option in $Script:WeekdayOptions) {
+        $chkDay = New-Object System.Windows.Forms.CheckBox
+        $chkDay.Text = $option.Label
+        $chkDay.Tag = $option.Name
+        $chkDay.AutoSize = $true
+        $chkDay.Location = New-Object System.Drawing.Point($dayLeft, 58)
+        $chkDay.Checked = ($cfgSection.DaysOfWeek -contains $option.Name)
+        $grp.Controls.Add($chkDay)
+        $dayCheckboxes += $chkDay
+        $dayLeft += 42
+    }
+
     $lstTimes = New-Object System.Windows.Forms.ListBox
-    $lstTimes.Location = New-Object System.Drawing.Point(14, 58)
+    $lstTimes.Location = New-Object System.Drawing.Point(14, 88)
     $lstTimes.Size     = New-Object System.Drawing.Size(110, 95)
     $grp.Controls.Add($lstTimes)
     Set-ListBoxTimes $lstTimes $cfgSection.RecoveryTimes
 
     $txtPreview = New-Object System.Windows.Forms.TextBox
-    $txtPreview.Location   = New-Object System.Drawing.Point(136, 58)
+    $txtPreview.Location   = New-Object System.Drawing.Point(136, 88)
     $txtPreview.Size       = New-Object System.Drawing.Size(330, 95)
     $txtPreview.Multiline  = $true
     $txtPreview.ReadOnly   = $true
@@ -572,39 +673,47 @@ function New-ToolSection ([string]$tool, [int]$top, $parentForm, $cfgSection) {
     $grp.Controls.Add($txtPreview)
 
     $lblSt = New-Object System.Windows.Forms.Label
-    $lblSt.Location = New-Object System.Drawing.Point(14, 164)
+    $lblSt.Location = New-Object System.Drawing.Point(14, 194)
     $lblSt.Size     = New-Object System.Drawing.Size(310, 18)
     $grp.Controls.Add($lblSt)
 
     $btnOn = New-Object System.Windows.Forms.Button
     $btnOn.Text     = "保存して有効化"
-    $btnOn.Location = New-Object System.Drawing.Point(14, 186)
+    $btnOn.Location = New-Object System.Drawing.Point(14, 218)
     $btnOn.Size     = New-Object System.Drawing.Size(120, 28)
     $grp.Controls.Add($btnOn)
 
     $btnOff = New-Object System.Windows.Forms.Button
     $btnOff.Text     = "無効化"
-    $btnOff.Location = New-Object System.Drawing.Point(142, 186)
+    $btnOff.Location = New-Object System.Drawing.Point(142, 218)
     $btnOff.Size     = New-Object System.Drawing.Size(100, 28)
     $grp.Controls.Add($btnOff)
 
     $btnNow = New-Object System.Windows.Forms.Button
     $btnNow.Text     = "今すぐ kick"
-    $btnNow.Location = New-Object System.Drawing.Point(250, 186)
+    $btnNow.Location = New-Object System.Drawing.Point(250, 218)
     $btnNow.Size     = New-Object System.Drawing.Size(100, 28)
     $grp.Controls.Add($btnNow)
 
     $lblCmd = New-Object System.Windows.Forms.Label
-    $lblCmd.Location  = New-Object System.Drawing.Point(356, 186)
+    $lblCmd.Location  = New-Object System.Drawing.Point(356, 218)
     $lblCmd.Size      = New-Object System.Drawing.Size(110, 28)
     $lblCmd.ForeColor = [System.Drawing.Color]::Gray
     $lblCmd.Font      = New-Object System.Drawing.Font("Consolas", 7.0)
     $lblCmd.TextAlign = "MiddleLeft"
     $grp.Controls.Add($lblCmd)
 
+    $getSelectedDays = {
+        $selected = @()
+        foreach ($chkDay in $dayCheckboxes) {
+            if ($chkDay.Checked) { $selected += [string]$chkDay.Tag }
+        }
+        return @(Get-NormalizedDaysOfWeek $selected)
+    }.GetNewClosure()
+
     $updatePreview = {
         try {
-            $plan = Get-RecoveryPlan (Get-ListBoxTimes $lstTimes)
+            $plan = Get-RecoveryPlan (Get-ListBoxTimes $lstTimes) (& $getSelectedDays)
             $txtPreview.Text = Get-RecoveryPlanText $plan
             if ($plan.IsValid) {
                 $txtPreview.ForeColor = [System.Drawing.Color]::FromArgb(40, 40, 40)
@@ -618,7 +727,10 @@ function New-ToolSection ([string]$tool, [int]$top, $parentForm, $cfgSection) {
             return [PSCustomObject]@{
                 IsValid = $false
                 RecoveryTimes = @()
+                DaysOfWeek = @()
+                DayLabels = @()
                 Items = @()
+                KickMinutes = @()
                 Issues = @($_.Exception.Message)
             }
         }
@@ -673,20 +785,26 @@ function New-ToolSection ([string]$tool, [int]$top, $parentForm, $cfgSection) {
         $btnRemove.Enabled = ($null -ne $lstTimes.SelectedItem)
     }.GetNewClosure())
 
+    foreach ($chkDay in $dayCheckboxes) {
+        $chkDay.Add_CheckedChanged({ & $updateStatus }.GetNewClosure())
+    }
+
     $chkWSL.Add_CheckedChanged({ & $updateStatus }.GetNewClosure())
 
     $btnOn.Add_Click({
         $times = Get-ListBoxTimes $lstTimes
-        $plan = Get-RecoveryPlan $times
+        $days = & $getSelectedDays
+        $plan = Get-RecoveryPlan $times $days
         if (-not $plan.IsValid) {
             [System.Windows.Forms.MessageBox]::Show(($plan.Issues -join "`r`n"), "$tool の設定を修正してください", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
             return
         }
 
         try {
-            Register-KickTask $tool $times $chkWSL.Checked
+            Register-KickTask $tool $times $days $chkWSL.Checked
             $config = Load-Config
             $config.$tool.RecoveryTimes = @($plan.RecoveryTimes)
+            $config.$tool.DaysOfWeek = @($plan.DaysOfWeek)
             $config.$tool.UseWSL = $chkWSL.Checked
             Save-Config $config
         } catch {
@@ -706,11 +824,11 @@ function New-ToolSection ([string]$tool, [int]$top, $parentForm, $cfgSection) {
 }
 
 New-ToolSection "Claude" 60  $form $cfg.Claude
-New-ToolSection "Codex"  290 $form $cfg.Codex
+New-ToolSection "Codex"  335 $form $cfg.Codex
 
 $grpLog = New-Object System.Windows.Forms.GroupBox
 $grpLog.Text     = "ログ"
-$grpLog.Location = New-Object System.Drawing.Point(12, 520)
+$grpLog.Location = New-Object System.Drawing.Point(12, 610)
 $grpLog.Size     = New-Object System.Drawing.Size(480, 160)
 $form.Controls.Add($grpLog)
 
@@ -762,8 +880,8 @@ $btnGitHub.Add_Click({
 })
 
 $lblInfo = New-Object System.Windows.Forms.Label
-$lblInfo.Text      = "回復時刻ごとに5時間前を計算 / Claude: $($Script:ClaudeModel) / Codex: $($Script:CodexModel)"
-$lblInfo.Location  = New-Object System.Drawing.Point(12, 692)
+$lblInfo.Text      = "平日デフォルト / 5時間前から再試行 / Claude: $($Script:ClaudeModel) / Codex: $($Script:CodexModel)"
+$lblInfo.Location  = New-Object System.Drawing.Point(12, 782)
 $lblInfo.Size      = New-Object System.Drawing.Size(480, 20)
 $lblInfo.ForeColor = [System.Drawing.Color]::Gray
 $lblInfo.Font      = New-Object System.Drawing.Font("Consolas", 7.5)
