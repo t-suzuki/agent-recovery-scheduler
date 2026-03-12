@@ -149,6 +149,16 @@ function ConvertTo-PowerShellArrayLiteral ([string[]]$values) {
     return "@(" + ($literals -join ", ") + ")"
 }
 
+function ConvertTo-WSLPath ([string]$windowsPath) {
+    if ([string]::IsNullOrWhiteSpace($windowsPath)) { return $windowsPath }
+    if ($windowsPath -match '^([A-Za-z]):\\(.*)$') {
+        $drive = $matches[1].ToLowerInvariant()
+        $rest = ($matches[2] -replace '\\', '/')
+        return "/mnt/$drive/$rest"
+    }
+    return ($windowsPath -replace '\\', '/')
+}
+
 function Escape-ForPowerShellDoubleQuotedString ([string]$value) {
     return ($value -replace '`', '``' -replace '"', '`"')
 }
@@ -394,7 +404,7 @@ function Get-CommandStatus ([scriptblock]$action) {
 }
 
 # ── 実行コマンド構築 ─────────────────────────────────────────────────
-function Get-CommandParts ([string]$tool) {
+function Get-CommandParts ([string]$tool, [bool]$useWSL = $false) {
     switch ($tool) {
         "Claude" {
             return [PSCustomObject]@{
@@ -405,7 +415,7 @@ function Get-CommandParts ([string]$tool) {
         "Codex" {
             return [PSCustomObject]@{
                 FilePath = "codex"
-                Arguments = @("exec", "--ephemeral", "--model", $Script:CodexModel, $Script:DefaultPrompt)
+                Arguments = @("exec", "--ephemeral", "--skip-git-repo-check", "--model", $Script:CodexModel, $Script:DefaultPrompt)
             }
         }
         default {
@@ -414,8 +424,7 @@ function Get-CommandParts ([string]$tool) {
     }
 }
 
-function Build-Command ([string]$tool, [bool]$useWSL) {
-    $parts = Get-CommandParts $tool
+function Build-InnerCommand ($parts) {
     $quotedArgs = @()
     foreach ($arg in $parts.Arguments) {
         if ($arg -match '^[A-Za-z0-9._:/=-]+$') {
@@ -424,9 +433,57 @@ function Build-Command ([string]$tool, [bool]$useWSL) {
             $quotedArgs += (ConvertTo-BashSingleQuotedLiteral $arg)
         }
     }
-    $inner = ($parts.FilePath + " " + ($quotedArgs -join " ")).Trim()
+    return ($parts.FilePath + " " + ($quotedArgs -join " ")).Trim()
+}
 
-    if ($useWSL) { return "wsl bash -lic " + (ConvertTo-BashSingleQuotedLiteral $inner) }
+function Build-QuotedBashArguments ([string[]]$values) {
+    $quotedArgs = @()
+    foreach ($value in $values) {
+        if ($value -match '^[A-Za-z0-9._:/=-]+$') {
+            $quotedArgs += $value
+        } else {
+            $quotedArgs += (ConvertTo-BashSingleQuotedLiteral $value)
+        }
+    }
+    return ($quotedArgs -join " ")
+}
+
+function Build-WSLInnerScript ([string]$tool, $parts) {
+    $wslWorkingDir = ConvertTo-WSLPath $Script:ScriptDir
+
+    if ($tool -eq "Codex") {
+        $quotedArgs = Build-QuotedBashArguments $parts.Arguments
+        $bootstrap = @(
+            'CODEX_BIN="$(command -v codex 2>/dev/null || true)"'
+            'if [ -z "$CODEX_BIN" ]; then'
+            '  CODEX_BIN="$(ls -1d /mnt/c/Users/*/.vscode/extensions/openai.chatgpt-*/bin/linux-x86_64/codex 2>/dev/null | sort -V | tail -n 1)"'
+            'fi'
+            'if [ -z "$CODEX_BIN" ]; then'
+            '  echo "codex not found" >&2'
+            '  exit 127'
+            'fi'
+            'cd ' + (ConvertTo-BashSingleQuotedLiteral $wslWorkingDir)
+            '"' + '$CODEX_BIN' + '" ' + $quotedArgs
+        ) -join '; '
+        return $bootstrap
+    }
+
+    $inner = Build-InnerCommand $parts
+    return "cd " + (ConvertTo-BashSingleQuotedLiteral $wslWorkingDir) + " && " + $inner
+}
+
+function Build-WSLCommand ([string]$tool, $parts) {
+    $bashMode = "-lic"
+    if ($tool -eq "Codex") { $bashMode = "-ilc" }
+    return "wsl bash $bashMode " + (ConvertTo-BashSingleQuotedLiteral (Build-WSLInnerScript $tool $parts))
+}
+
+function Build-Command ([string]$tool, [bool]$useWSL) {
+    $parts = Get-CommandParts $tool $useWSL
+    $inner = Build-InnerCommand $parts
+    if ($useWSL) {
+        return Build-WSLCommand $tool $parts
+    }
     return $inner
 }
 
@@ -434,12 +491,15 @@ function Build-Command ([string]$tool, [bool]$useWSL) {
 function Create-WrapperScript ([string]$tool, [bool]$useWSL) {
     $ps1Path = Join-Path $Script:ConfigDir "kick-$($tool.ToLower()).ps1"
     $vbsPath = Join-Path $Script:ConfigDir "kick-$($tool.ToLower()).vbs"
-    $command = Get-CommandParts $tool
+    $workingDirLiteral = ConvertTo-PSSingleQuotedLiteral $Script:ScriptDir
     if ($useWSL) {
-        $inner = Build-Command $tool $false
+        $command = Get-CommandParts $tool $true
         $filePathLiteral = ConvertTo-PSSingleQuotedLiteral "wsl"
-        $argumentsLiteral = ConvertTo-PowerShellArrayLiteral @("bash", "-lic", $inner)
+        $bashMode = "-lic"
+        if ($tool -eq "Codex") { $bashMode = "-ilc" }
+        $argumentsLiteral = ConvertTo-PowerShellArrayLiteral @("bash", $bashMode, (Build-WSLInnerScript $tool $command))
     } else {
+        $command = Get-CommandParts $tool $false
         $filePathLiteral = ConvertTo-PSSingleQuotedLiteral $command.FilePath
         $argumentsLiteral = ConvertTo-PowerShellArrayLiteral $command.Arguments
     }
@@ -449,21 +509,44 @@ function Create-WrapperScript ([string]$tool, [bool]$useWSL) {
 `$ErrorActionPreference = 'Stop'
 `$ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 `$global:LASTEXITCODE = `$null
+`$outputLines = New-Object 'System.Collections.Generic.List[string]'
+`$workingDir = $workingDirLiteral
 `$filePath = $filePathLiteral
 `$arguments = $argumentsLiteral
+`$stdoutPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.Guid]::NewGuid().ToString() + '-stdout.log')
+`$stderrPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.Guid]::NewGuid().ToString() + '-stderr.log')
 try {
-    & `$filePath @arguments 2>&1 | Out-Null
-    if (`$null -ne `$global:LASTEXITCODE) {
-        if (`$global:LASTEXITCODE -eq 0) {
-            `$status = 'OK'
-        } else {
-            `$status = "FAIL(exit=`$global:LASTEXITCODE)"
+    [System.Environment]::CurrentDirectory = `$workingDir
+    Set-Location -LiteralPath `$workingDir
+    `$proc = Start-Process -FilePath `$filePath -ArgumentList `$arguments -WorkingDirectory `$workingDir -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput `$stdoutPath -RedirectStandardError `$stderrPath
+    `$global:LASTEXITCODE = `$proc.ExitCode
+    foreach (`$path in @(`$stdoutPath, `$stderrPath)) {
+        if (Test-Path `$path) {
+            foreach (`$line in (Get-Content -LiteralPath `$path -ErrorAction SilentlyContinue)) {
+                if (-not [string]::IsNullOrWhiteSpace(`$line)) {
+                    [void]`$outputLines.Add(`$line.TrimEnd())
+                }
+            }
         }
-    } else {
+    }
+    if (`$proc.ExitCode -eq 0) {
         `$status = 'OK'
+    } else {
+        `$status = "FAIL(exit=`$(`$proc.ExitCode))"
     }
 } catch {
     `$status = "ERROR: `$(`$_.Exception.Message)"
+    foreach (`$line in ((`$_ | Out-String) -split "`r?`n")) {
+        if (-not [string]::IsNullOrWhiteSpace(`$line)) {
+            [void]`$outputLines.Add(`$line.TrimEnd())
+        }
+    }
+} finally {
+    foreach (`$path in @(`$stdoutPath, `$stderrPath)) {
+        if (Test-Path `$path) {
+            Remove-Item -LiteralPath `$path -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 `$encoding = New-Object System.Text.UTF8Encoding(`$false)
 for (`$attempt = 0; `$attempt -lt 5; `$attempt++) {
@@ -472,6 +555,11 @@ for (`$attempt = 0; `$attempt -lt 5; `$attempt++) {
         try {
             `$writer = New-Object System.IO.StreamWriter(`$stream, `$encoding)
             `$writer.WriteLine("`$ts [$tool] `$status")
+            if (`$status -ne 'OK') {
+                foreach (`$line in `$outputLines) {
+                    `$writer.WriteLine("`$ts [$tool] OUTPUT: `$line")
+                }
+            }
             `$writer.Flush()
         } finally {
             if (`$writer) { `$writer.Dispose() }
@@ -482,10 +570,16 @@ for (`$attempt = 0; `$attempt -lt 5; `$attempt++) {
         Start-Sleep -Milliseconds 100
     }
 }
+if (`$null -ne `$global:LASTEXITCODE) {
+    exit `$global:LASTEXITCODE
+}
+if (`$status -like 'ERROR:*') {
+    exit 1
+}
 "@
     Set-Content -Path $ps1Path -Value $ps1Content -Encoding UTF8
 
-    $vbsContent = "CreateObject(""WScript.Shell"").Run ""powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """"$ps1Path"""""", 0, False"
+    $vbsContent = "CreateObject(""WScript.Shell"").Run ""powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """"$ps1Path"""""", 0, True"
     Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII
 
     return $vbsPath
@@ -553,11 +647,14 @@ function Unregister-KickTask ([string]$tool) {
 
 function Invoke-KickNow ([string]$tool, [bool]$useWSL) {
     $preview = Build-Command $tool $useWSL
-    $parts = Get-CommandParts $tool
     if ($useWSL) {
+        $parts = Get-CommandParts $tool $true
         $filePath = "wsl"
-        $arguments = @("bash", "-lic", (Build-Command $tool $false))
+        $bashMode = "-lic"
+        if ($tool -eq "Codex") { $bashMode = "-ilc" }
+        $arguments = @("bash", $bashMode, (Build-WSLInnerScript $tool $parts))
     } else {
+        $parts = Get-CommandParts $tool $false
         $filePath = $parts.FilePath
         $arguments = $parts.Arguments
     }
